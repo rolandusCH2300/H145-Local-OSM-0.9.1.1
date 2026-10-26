@@ -1,0 +1,442 @@
+name: GUI portable package
+
+on:
+  workflow_dispatch:
+  pull_request:
+    paths:
+      - "local_osm/**"
+      - "tests/**"
+      - "h145_local_osm_gui.py"
+      - "icon.png"
+      - "LICENSE"
+      - "THIRD_PARTY_NOTICES.md"
+      - "requirements-release.txt"
+      - "requirements-security.txt"
+      - "tools/build_portable_gui.ps1"
+      - "tools/osmium/pinned-versions.env"
+      - "tools/security/**"
+      - ".github/workflows/gui-package.yml"
+  push:
+    branches:
+      - main
+    paths:
+      - "release/VERSION"
+
+jobs:
+  build-osmium:
+    name: Build and verify native Osmium runtime
+    runs-on: windows-2022
+    timeout-minutes: 45
+    permissions:
+      contents: read
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Load pinned Osmium source versions
+        shell: bash
+        run: cat tools/osmium/pinned-versions.env >> "$GITHUB_ENV"
+
+      - name: Clone pinned Osmium sources
+        shell: bash
+        run: |
+          mkdir -p vendor
+          git clone --quiet --depth 1 --branch "$OSMIUM_VERSION" \
+            https://github.com/osmcode/osmium-tool.git vendor/osmium-tool
+          git clone --quiet --depth 1 --branch "$LIBOSMIUM_VERSION" \
+            https://github.com/osmcode/libosmium.git vendor/libosmium
+          git clone --quiet --depth 1 --branch "$PROTOZERO_VERSION" \
+            https://github.com/mapbox/protozero.git vendor/protozero
+
+      - name: Install native dependencies with vcpkg
+        shell: bash
+        run: |
+          vcpkg install \
+            boost-program-options:x64-windows \
+            bzip2:x64-windows \
+            expat:x64-windows \
+            lz4:x64-windows \
+            nlohmann-json:x64-windows \
+            zlib:x64-windows
+
+      - name: Configure Osmium Tool
+        shell: bash
+        run: |
+          cmake -S vendor/osmium-tool -B vendor/osmium-tool/build \
+            -A x64 \
+            -DCMAKE_TOOLCHAIN_FILE=C:/vcpkg/scripts/buildsystems/vcpkg.cmake \
+            -DOsmium_DEBUG=TRUE \
+            -DPROTOZERO_INCLUDE_DIR="$GITHUB_WORKSPACE/vendor/protozero/include"
+
+      - name: Build Osmium Tool
+        shell: bash
+        run: cmake --build vendor/osmium-tool/build --config Release --verbose
+
+      - name: Run upstream Osmium tests
+        shell: bash
+        run: |
+          ctest --test-dir vendor/osmium-tool/build \
+            -C Release --output-on-failure
+
+      - name: Package native Osmium runtime
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          $out = Join-Path $env:GITHUB_WORKSPACE "dist\osmium"
+          New-Item -ItemType Directory -Force $out | Out-Null
+
+          $exe = Join-Path $env:GITHUB_WORKSPACE "vendor\osmium-tool\build\src\Release\osmium.exe"
+          if (-not (Test-Path -LiteralPath $exe -PathType Leaf)) {
+            throw "Expected Osmium Tool executable was not produced: $exe"
+          }
+          Copy-Item $exe (Join-Path $out "osmium.exe")
+
+          $buildDlls = Join-Path $env:GITHUB_WORKSPACE "vendor\osmium-tool\build\src\Release\*.dll"
+          Copy-Item $buildDlls $out -ErrorAction SilentlyContinue
+
+          $vcpkgDlls = "C:\vcpkg\installed\x64-windows\bin\*.dll"
+          Copy-Item $vcpkgDlls $out
+
+          $license = Join-Path $env:GITHUB_WORKSPACE "vendor\osmium-tool\LICENSE.txt"
+          Copy-Item $license (Join-Path $out "OSMIUM-TOOL-LICENSE.txt")
+
+          @(
+            "osmium-tool=$env:OSMIUM_VERSION"
+            "libosmium=$env:LIBOSMIUM_VERSION"
+            "protozero=$env:PROTOZERO_VERSION"
+            "architecture=x64"
+          ) | Set-Content -Encoding ascii (Join-Path $out "VERSIONS.txt")
+
+          $runtimeExe = Join-Path $out "osmium.exe"
+          $output = (& $runtimeExe --version 2>&1 | Out-String).Trim()
+          if ($LASTEXITCODE -ne 0) {
+            throw "Bundled Osmium runtime failed to execute."
+          }
+          $expected = $env:OSMIUM_VERSION.TrimStart('v')
+          if ($output -notmatch [regex]::Escape($expected)) {
+            throw "Bundled Osmium version did not match expected $expected. Output: $output"
+          }
+
+          foreach ($required in @("OSMIUM-TOOL-LICENSE.txt", "VERSIONS.txt")) {
+            if (-not (Test-Path -LiteralPath (Join-Path $out $required) -PathType Leaf)) {
+              throw "Required Osmium runtime file is missing: $required"
+            }
+          }
+          $dlls = @(Get-ChildItem -Path $out -Filter "*.dll" -File)
+          if ($dlls.Count -eq 0) {
+            throw "No native runtime DLLs were packaged with Osmium Tool."
+          }
+          Write-Host $output
+          Write-Host "Packaged $($dlls.Count) native runtime DLLs."
+
+      - name: Defender scan native Osmium runtime
+        shell: pwsh
+        run: |
+          .\tools\security\verify_windows_artifacts.ps1 `
+            -Path ".\dist\osmium" `
+            -HashOutput ".\dist\osmium\OSMIUM-SHA256SUMS.txt" `
+            -ReportOutput ".\dist\osmium\OSMIUM-DEFENDER-SCAN.txt"
+
+      - name: Upload verified Osmium runtime for packaging
+        uses: actions/upload-artifact@v4
+        with:
+          name: osmium-runtime-${{ github.sha }}
+          path: dist/osmium/
+          if-no-files-found: error
+          retention-days: 1
+
+  windows-package:
+    name: Build and verify Windows release artifact
+    needs:
+      - build-osmium
+    runs-on: windows-latest
+    timeout-minutes: 45
+    permissions:
+      contents: read
+      id-token: write
+      attestations: write
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Load pinned Osmium source versions
+        shell: bash
+        run: cat tools/osmium/pinned-versions.env >> "$GITHUB_ENV"
+
+      - name: Download verified native Osmium runtime
+        uses: actions/download-artifact@v4
+        with:
+          name: osmium-runtime-${{ github.sha }}
+          path: .native-osmium-artifact
+
+      - name: Install and verify native Osmium runtime
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          $sourceExe = Get-ChildItem -Path ".native-osmium-artifact" -Filter "osmium.exe" -File -Recurse | Select-Object -First 1
+          if ($null -eq $sourceExe) {
+            throw "Verified Osmium artifact did not contain osmium.exe."
+          }
+
+          $sourceRoot = $sourceExe.Directory.FullName
+          $target = Join-Path $env:GITHUB_WORKSPACE "tools\osmium"
+          if (Test-Path -LiteralPath $target) {
+            Remove-Item -LiteralPath $target -Recurse -Force
+          }
+          New-Item -ItemType Directory -Force $target | Out-Null
+          Copy-Item (Join-Path $sourceRoot "*") $target -Recurse -Force
+
+          $exe = Join-Path $target "osmium.exe"
+          foreach ($required in @(
+            $exe,
+            (Join-Path $target "OSMIUM-TOOL-LICENSE.txt"),
+            (Join-Path $target "VERSIONS.txt"),
+            (Join-Path $target "OSMIUM-SHA256SUMS.txt"),
+            (Join-Path $target "OSMIUM-DEFENDER-SCAN.txt")
+          )) {
+            if (-not (Test-Path -LiteralPath $required -PathType Leaf)) {
+              throw "Required verified Osmium runtime file is missing: $required"
+            }
+          }
+
+          $dlls = @(Get-ChildItem -Path $target -Filter "*.dll" -File)
+          if ($dlls.Count -eq 0) {
+            throw "Verified Osmium artifact contained no runtime DLLs."
+          }
+
+          $output = (& $exe --version 2>&1 | Out-String).Trim()
+          if ($LASTEXITCODE -ne 0) {
+            throw "Verified Osmium runtime failed to execute before packaging."
+          }
+          $expected = $env:OSMIUM_VERSION.TrimStart('v')
+          if ($output -notmatch [regex]::Escape($expected)) {
+            throw "Verified Osmium runtime version did not match expected $expected. Output: $output"
+          }
+          Write-Host $output
+          Write-Host "Native Osmium runtime is ready for GUI packaging."
+
+      - name: Set up Python 3.13
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+
+      - name: Install pinned dependency audit tool
+        run: python -m pip install -r requirements-security.txt
+
+      - name: Audit pinned release dependency set
+        run: python -m pip_audit -r requirements-release.txt --progress-spinner off
+
+      - name: Run full unit-test suite
+        run: python -m unittest discover -s tests -v
+
+      - name: Build portable application from pinned release requirements
+        shell: pwsh
+        run: .\tools\build_portable_gui.ps1 -RequirementsFile "requirements-release.txt"
+
+      - name: Verify packaged license notices
+        shell: pwsh
+        run: |
+          foreach ($required in @(
+            ".\dist\H145-Local-OSM\LICENSE",
+            ".\dist\H145-Local-OSM\THIRD_PARTY_NOTICES.md"
+          )) {
+            if (-not (Test-Path -LiteralPath $required -PathType Leaf)) {
+              throw "Production package is missing required license notice: $required"
+            }
+          }
+          Write-Host "Packaged project and third-party license notices verified."
+
+      - name: Verify packaged GUI subsystem
+        shell: pwsh
+        run: |
+          $exe = Resolve-Path ".\dist\H145-Local-OSM\H145-Local-OSM.exe"
+          $bytes = [System.IO.File]::ReadAllBytes($exe)
+          $peOffset = [BitConverter]::ToInt32($bytes, 0x3c)
+          $subsystem = [BitConverter]::ToUInt16($bytes, $peOffset + 24 + 68)
+          if ($subsystem -ne 2) {
+            throw "Packaged executable uses PE subsystem $subsystem; expected 2 (Windows GUI/no console)."
+          }
+          Write-Host "Packaged executable uses the Windows GUI subsystem (no console window)."
+
+      - name: Verify packaged native Osmium runtime
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          $runtime = Join-Path $env:GITHUB_WORKSPACE "dist\H145-Local-OSM\_internal\tools\osmium"
+          $exe = Join-Path $runtime "osmium.exe"
+
+          foreach ($required in @(
+            $exe,
+            (Join-Path $runtime "OSMIUM-TOOL-LICENSE.txt"),
+            (Join-Path $runtime "VERSIONS.txt"),
+            (Join-Path $runtime "OSMIUM-SHA256SUMS.txt"),
+            (Join-Path $runtime "OSMIUM-DEFENDER-SCAN.txt")
+          )) {
+            if (-not (Test-Path -LiteralPath $required -PathType Leaf)) {
+              throw "Production package is missing required Osmium runtime file: $required"
+            }
+          }
+
+          $dlls = @(Get-ChildItem -Path $runtime -Filter "*.dll" -File)
+          if ($dlls.Count -eq 0) {
+            throw "Production package contains no Osmium runtime DLLs."
+          }
+
+          $output = (& $exe --version 2>&1 | Out-String).Trim()
+          if ($LASTEXITCODE -ne 0) {
+            throw "Packaged Osmium runtime failed to execute."
+          }
+          $expected = $env:OSMIUM_VERSION.TrimStart('v')
+          if ($output -notmatch [regex]::Escape($expected)) {
+            throw "Packaged Osmium runtime version did not match expected $expected. Output: $output"
+          }
+
+          Copy-Item (Join-Path $runtime "VERSIONS.txt") ".\dist\OSMIUM-VERSIONS.txt"
+          Copy-Item (Join-Path $runtime "OSMIUM-SHA256SUMS.txt") ".\dist\OSMIUM-SHA256SUMS.txt"
+          Copy-Item (Join-Path $runtime "OSMIUM-DEFENDER-SCAN.txt") ".\dist\OSMIUM-DEFENDER-SCAN.txt"
+
+          Write-Host $output
+          Write-Host "Packaged native Osmium runtime verified with $($dlls.Count) DLLs."
+
+      - name: Record resolved Python dependency snapshot
+        shell: pwsh
+        run: |
+          $out = ".\dist\PYTHON-DEPENDENCIES.txt"
+          $pythonVersion = (python --version)
+          @(
+            "H145 Local OSM resolved release environment"
+            "Commit: $env:GITHUB_SHA"
+            "$pythonVersion"
+            ""
+          ) | Set-Content -Encoding utf8 $out
+          python -m pip freeze | Sort-Object | Add-Content -Encoding utf8 $out
+          Get-Content $out
+
+      - name: Smoke packaged multiprocessing dispatch
+        shell: pwsh
+        run: |
+          $exe = Resolve-Path ".\dist\H145-Local-OSM\H145-Local-OSM.exe"
+          $before = @(Get-Process -Name "H145-Local-OSM" -ErrorAction SilentlyContinue | Select-Object -ExpandProperty Id)
+          $process = Start-Process -FilePath $exe -ArgumentList "--internal-task", "multiprocessing-probe" -PassThru
+          if (-not $process.WaitForExit(30000)) {
+            Stop-Process -Id $process.Id -Force -ErrorAction SilentlyContinue
+            throw "Packaged multiprocessing probe did not finish; a spawned worker may have fallen through into the GUI."
+          }
+          if ($process.ExitCode -ne 0) {
+            throw "Packaged multiprocessing probe failed with exit code $($process.ExitCode)."
+          }
+          Start-Sleep -Seconds 2
+          $after = @(Get-Process -Name "H145-Local-OSM" -ErrorAction SilentlyContinue | Where-Object { $before -notcontains $_.Id })
+          if ($after.Count -gt 0) {
+            $ids = ($after | Select-Object -ExpandProperty Id) -join ", "
+            $after | Stop-Process -Force -ErrorAction SilentlyContinue
+            throw "Packaged multiprocessing probe left stray H145 Local OSM process(es): $ids"
+          }
+          Write-Host "Packaged multiprocessing dispatch smoke test passed with no stray GUI process."
+
+      - name: Smoke launch packaged GUI
+        shell: pwsh
+        run: |
+          $exe = Resolve-Path ".\dist\H145-Local-OSM\H145-Local-OSM.exe"
+          $process = Start-Process -FilePath $exe -PassThru
+          Start-Sleep -Seconds 4
+          if ($process.HasExited) {
+            throw "Packaged GUI exited unexpectedly with code $($process.ExitCode)."
+          }
+          Stop-Process -Id $process.Id -Force
+          $process.WaitForExit()
+          Write-Host "Packaged GUI launch smoke test passed."
+
+      - name: Create portable ZIP
+        shell: pwsh
+        run: |
+          $archive = Join-Path $env:GITHUB_WORKSPACE "dist\H145-Local-OSM-portable.zip"
+          if (Test-Path -LiteralPath $archive) {
+            Remove-Item -LiteralPath $archive -Force
+          }
+          & tar.exe -a -c -f $archive -C (Join-Path $env:GITHUB_WORKSPACE "dist") "H145-Local-OSM"
+          if ($LASTEXITCODE -ne 0) {
+            throw "Failed to create portable ZIP."
+          }
+
+      - name: Defender malware scan and SHA-256 manifest
+        shell: pwsh
+        run: |
+          .\tools\security\verify_windows_artifacts.ps1 `
+            -Path ".\dist" `
+            -HashOutput ".\dist\SHA256SUMS.txt" `
+            -ReportOutput ".\dist\DEFENDER-SCAN.txt"
+
+      - name: Attest portable ZIP
+        if: ${{ github.event_name == 'push' && (github.event.repository.visibility == 'public' || vars.ENABLE_PRIVATE_ATTESTATIONS == 'true') }}
+        uses: actions/attest@v4
+        with:
+          subject-path: dist/H145-Local-OSM-portable.zip
+
+      - name: Upload verified release assets
+        uses: actions/upload-artifact@v4
+        with:
+          name: H145-Local-OSM-release-assets
+          path: |
+            dist/H145-Local-OSM-portable.zip
+            dist/SHA256SUMS.txt
+            dist/DEFENDER-SCAN.txt
+            dist/PYTHON-DEPENDENCIES.txt
+            dist/OSMIUM-VERSIONS.txt
+            dist/OSMIUM-SHA256SUMS.txt
+            dist/OSMIUM-DEFENDER-SCAN.txt
+          if-no-files-found: error
+          retention-days: 30
+
+  publish-release:
+    name: Publish immutable GitHub release
+    if: ${{ github.event_name == 'push' }}
+    needs:
+      - windows-package
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+
+    steps:
+      - name: Check out release metadata
+        uses: actions/checkout@v4
+
+      - name: Download verified release assets
+        uses: actions/download-artifact@v4
+        with:
+          name: H145-Local-OSM-release-assets
+          path: release-assets
+
+      - name: Create draft release, attach all assets, then publish
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          tag="$(tr -d '\r\n' < release/VERSION)"
+          if [ -z "$tag" ]; then
+            echo "release/VERSION is empty" >&2
+            exit 1
+          fi
+
+          gh release create "$tag" \
+            release-assets/H145-Local-OSM-portable.zip \
+            release-assets/SHA256SUMS.txt \
+            release-assets/DEFENDER-SCAN.txt \
+            release-assets/PYTHON-DEPENDENCIES.txt \
+            release-assets/OSMIUM-VERSIONS.txt \
+            release-assets/OSMIUM-SHA256SUMS.txt \
+            release-assets/OSMIUM-DEFENDER-SCAN.txt \
+            --repo "$GITHUB_REPOSITORY" \
+            --target "$GITHUB_SHA" \
+            --title "H145 Local OSM $tag" \
+            --notes-file release/RELEASE_NOTES.md \
+            --draft
+
+          gh release edit "$tag" \
+            --repo "$GITHUB_REPOSITORY" \
+            --draft=false
+
+          echo "Published immutable release:"
+          gh release view "$tag" --repo "$GITHUB_REPOSITORY" --json url --jq .url

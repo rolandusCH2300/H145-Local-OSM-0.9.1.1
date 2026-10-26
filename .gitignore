@@ -1,0 +1,25 @@
+data/
+downloads/
+reports/
+config.json
+
+__pycache__/
+*.py[cod]
+*.spec
+build/
+dist/
+
+*.osm.pbf
+*.sqlite3
+*.log
+
+R-E_Local_OSM_Next_Optimization_Plan.md
+
+tools/osmium/*.exe
+tools/osmium/*.dll
+tools/osmium/*.pdb
+tools/osmium/OSMIUM-TOOL-LICENSE.txt
+tools/osmium/VERSIONS.txt
+
+# Local backup of the pre-structural R&E patch
+local_osm/gui/rne_patch.py.orig

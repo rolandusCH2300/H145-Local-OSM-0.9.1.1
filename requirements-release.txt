@@ -1,0 +1,5 @@
+# Exact direct dependency versions used for official Windows release builds.
+PySide6-Essentials==6.11.2
+osmium==4.3.1
+pyinstaller==6.22.2
+Pillow==12.3.0
